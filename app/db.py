@@ -142,6 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_version_batch
 CREATE TABLE IF NOT EXISTS verification (
     verification_no  TEXT PRIMARY KEY,
     status           TEXT NOT NULL,             -- DRAFT / PENDING_REVIEW / CONFIRMED
+    revision         INTEGER NOT NULL DEFAULT 1, -- 单据修订号：创建=1，逐批快照写入（重新核验/修订批次清单）或确认写入确认快照时 +1；用于修订的乐观并发校验
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
     confirmed_at     TEXT
@@ -291,6 +292,7 @@ _MIGRATION_COLUMNS = [
     ("verification_confirmation_batch", "snapshot_ship_status", "TEXT"),
     ("verification_confirmation_batch", "snapshot_locked_lots", "TEXT NOT NULL DEFAULT '[]'"),
     ("verification_confirmation_batch", "snapshot_ship_reasons", "TEXT NOT NULL DEFAULT '[]'"),
+    ("verification", "revision", "INTEGER NOT NULL DEFAULT 1"),
 ]
 
 

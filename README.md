@@ -33,6 +33,15 @@
 含这些批次的**已确认核验单转待复核**，历次确认快照保持原样。未知批次或目标线、
 已作废批次、目标线与原线相同均整体拒绝，失败不留下部分归属或裁决版本。
 
+**出货前装运批次发生变化**时，工作人员可凭**所见单据修订号**为草稿或待复核核验单
+提交一份**完整、有序的新批次清单**（`POST /api/verifications/{no}/revise`）。保存时
+在**同一事务内逐批重取当前裁决与出货资格快照**，单据回到**草稿**并**推进修订号**；
+允许借此**移除旧清单中的已作废批次**，新清单中的批次必须**全部有效**。历次确认及其
+当时的逐批快照**始终保留**，即使旧批次已不在现行清单；**已确认单据不可直接修订**。
+空清单、重复或未知批次、含已作废批次、**过期修订号**均**整体拒绝**，当前成员与
+快照不变；并发的批次更正或批号锁定在写事务内串行化，逐批快照取自同一事务快照，
+单据不会混入不同时间的快照。重新核验、确认等其他单据快照写入同样推进修订号。
+
 - 技术栈：Python 3.11 + FastAPI + SQLite（标准库 `sqlite3`，WAL 模式）
 - 数据落盘：单个 SQLite 文件，Docker 卷持久化
 - 一键启动：`docker compose up`（首次启动自动建表、写入过敏原字典与演示原料批号）
@@ -223,7 +232,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 122 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、旧库升级
+python -m pytest -q            # 141 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -248,6 +257,10 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_void_demo.py
 # 误归产线更正（换线）端到端示例（两线重算/原线留空/历史产线序号不改/资格版本不递增/核验单联动）
 python examples/batch_reassign_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
+
+# 出货前批次清单修订端到端示例（修订号/同事务快照/过期拒绝/移除作废批次/历史确认保留）
+python examples/verification_revise_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/verification_revise_demo.py
 ```
 
 ---
@@ -564,8 +577,9 @@ BASE_URL=http://127.0.0.1:8080 python examples/batch_reassign_demo.py
 | --- | --- | --- |
 | POST | `/api/verifications` | 创建核验单（草稿）：唯一单号 + 非空、无重复的已登记批次号列表，逐批保存当前裁决版本/结论与出货资格版本/状态 |
 | GET | `/api/verifications?status=DRAFT` | 列出核验单，可按 `DRAFT` / `PENDING_REVIEW` / `CONFIRMED` 过滤 |
-| GET | `/api/verifications/{verification_no}` | 核验单详情：状态、逐批记录（裁决与出货资格的快照/当前版本/变化原因）、历次确认快照 |
+| GET | `/api/verifications/{verification_no}` | 核验单详情：状态、修订号 `revision`、逐批记录（裁决与出货资格的快照/当前版本/变化原因）、历次确认快照 |
 | POST | `/api/verifications/{verification_no}/reverify` | **重新核验**：刷新逐批快照并回到草稿（仅 DRAFT / PENDING_REVIEW 可调用） |
+| POST | `/api/verifications/{verification_no}/revise` | **修订批次清单**：凭所见修订号提交完整、有序的新批次清单（仅 DRAFT / PENDING_REVIEW）；同事务重取逐批快照、回到草稿并推进修订号 |
 | POST | `/api/verifications/{verification_no}/confirm` | **确认**：原子核对逐批裁决版本、出货资格版本与当前锁定状态 |
 
 **状态机**：
@@ -576,7 +590,57 @@ DRAFT ──confirm 成功──▶ CONFIRMED
   └── reverify ── PENDING_REVIEW ◀┘
 ```
 
-- 创建即 `DRAFT`，逐批冻结当时的裁决 `version`/`disposition` 与出货资格
+> 草稿/待复核还可通过 **revise（修订批次清单）** 用一份完整新清单替换成员，
+> 单据回到 `DRAFT` 并推进修订号；已确认单据必须先（因版本变化自动）转待复核才能修订。
+
+#### 修订号（revision，乐观并发）
+
+每张核验单维护只增的**修订号**：创建为 `1`；**重新核验、修订批次清单、确认**等
+单据快照写入各使修订号 `+1`（详情与列表均回显 `revision`）。批次更正/批号锁定只
+推进**逐批**裁决/出货资格版本，不推进单据修订号（草稿快照本就待刷新；若单据已
+确认则自动转待复核，待重新核验/修订后再确认）。
+
+#### 出货前批次清单修订（revise）
+
+出货前装运批次发生变化时，工作人员**先查询单据**看到当前修订号与成员顺序，再凭
+**所见修订号**提交完整、有序的新批次清单
+（`POST /api/verifications/{verification_no}/revise`）：
+
+```json
+{ "expected_revision": 3, "batch_nos": ["B003", "B001"] }
+```
+
+- **同事务重取快照**：`expected_revision` 校验通过后，在**同一 `BEGIN IMMEDIATE`
+  事务内**删除旧逐批记录、按新顺序逐批重取**当前**裁决版本/结论与出货资格版本/状态，
+  单据回到 `DRAFT`、修订号 `+1`。并发的批次更正/批号锁定由进程写锁串行化——
+  修订事务期间其它写操作要么已提交可见、要么尚未提交，**逐批快照全部取自同一事务
+  快照**，不会一部分取更正前、一部分取更正后。
+- **可移除已作废批次**：旧清单中的批次若在此期间被作废，可通过修订把它移出
+  （含作废批次的单据重新核验/确认仍被拒，修订是恢复单据可用的途径）；
+  但**新清单本身必须全部有效**——任何已作废批次出现在新清单中整体拒绝。
+- **确认历史不动**：修订只替换“当前成员与逐批快照”，
+  `verification_confirmation(_batch)` 历次确认及其当时逐批快照**始终保留**，
+  即使旧批次已不在现行清单；再次确认追加而非覆盖。
+- **已确认不可修订**：`CONFIRMED` 单据直接修订返回 409
+  `VERIFICATION_ALREADY_CONFIRMED`（须等其因版本变化转待复核后再修订）。
+- **整体拒绝（任一校验失败，当前成员与快照不变、修订号不变）**：
+
+| 场景 | HTTP | error.code |
+| --- | --- | --- |
+| 核验单不存在 | 404 | `VERIFICATION_NOT_FOUND` |
+| 修订已确认单据 | 409 | `VERIFICATION_ALREADY_CONFIRMED` |
+| 所见修订号过期（与当前修订号不一致） | 409 | `VERIFICATION_REVISION_CONFLICT`（`details` 含 `submitted_revision` / `current_revision`） |
+| 新清单含未登记批次 | 400 | `UNKNOWN_BATCH` |
+| 新清单内批次号重复 | 400 | `DUPLICATE_BATCH_IN_VERIFICATION` |
+| 新清单含已作废批次 | 400 | `BATCH_VOIDED` |
+| 清单元素为空/非字符串 | 400 | `INVALID_PAYLOAD` |
+| `batch_nos` 为空 / 缺字段 / `expected_revision` 缺失或 < 1 | 422 | FastAPI 模型校验 |
+
+冲突后客户端应重新 `GET` 单据取得最新 `revision` 与成员顺序，核对差异后用新修订号
+重新提交完整清单。
+
+
+- 创建即 `DRAFT`，修订号 `revision=1`，逐批冻结当时的裁决 `version`/`disposition` 与出货资格
   `shipment_eligibility.version`/`status`（双快照）。
 - 确认是一次**原子核对**，三项须逐批全部满足：
   1. 裁决快照版本等于当前裁决版本，且结论为 `RELEASE`；
@@ -646,6 +710,10 @@ DRAFT ──confirm 成功──▶ CONFIRMED
 | 单号为空 / 列表非数组 | 400 | `INVALID_PAYLOAD`（空列表为 422 模型校验） |
 | 核验单不存在 | 404 | `VERIFICATION_NOT_FOUND` |
 | 已确认单据再次确认或重新核验 | 409 | `VERIFICATION_ALREADY_CONFIRMED` |
+| 修订已确认单据的批次清单 | 409 | `VERIFICATION_ALREADY_CONFIRMED` |
+| 修订时所见修订号已过期 | 409 | `VERIFICATION_REVISION_CONFLICT` |
+| 修订新清单含未登记/重复/已作废批次 | 400 | `UNKNOWN_BATCH` / `DUPLICATE_BATCH_IN_VERIFICATION` / `BATCH_VOIDED` |
+| 修订清单为空或 `expected_revision` 缺失/非法 | 422/400 | FastAPI 模型校验 / `INVALID_PAYLOAD` |
 | 含已作废批次的单据重新核验/确认 | 409 | `VERIFICATION_CONTAINS_VOIDED_BATCH`（`details` 列作废批次及原因） |
 | 确认时存在不符批次 | 422 | `VERIFICATION_NOT_CONFIRMABLE`（`details` 逐批说明） |
 
@@ -757,6 +825,20 @@ curl -s -X POST http://127.0.0.1:8080/api/batches/B003/reassign \
 
 # 21) 查询历史裁决版本：v1 保留原产线/顺序号，v2 为换线后（MOVE_BATCH）
 curl -s http://127.0.0.1:8080/api/batches/B003/history
+
+# 22) 出货前装运批次变化：先查单据拿“所见修订号”，再提交完整、有序的新批次清单
+#     （同事务重取逐批当前裁决/出货资格快照；可移除旧清单中已作废批次；
+#      回到草稿并推进修订号；已确认单据不可直接修订）
+curl -s http://127.0.0.1:8080/api/verifications/SH-001
+curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/revise \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"batch_nos":["B003","B001"]}'
+
+# 23) 过期修订号（并发已有重新核验/修订/确认推进过修订号）-> 409 整体拒绝，
+#     error.details 给出 submitted_revision/current_revision；重新查询后用新号再提交
+curl -s -X POST http://127.0.0.1:8080/api/verifications/SH-001/revise \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"batch_nos":["B001"]}'
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -772,6 +854,10 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
 （拒绝场景 → 换线新旧归属/原线留空 → 两线重算与历史版本产线序号不改 →
 出货资格版本不递增 → 已确认单据转待复核且确认快照原样 → 顺序号不复用 →
 重新核验后二次确认与历史快照保留）；
+出货前批次清单修订全流程示例见 [`examples/verification_revise_demo.py`](examples/verification_revise_demo.py)
+（凭修订号替换完整有序清单 → 同事务重取快照 → 过期修订号并发拒绝 →
+未知/重复/空清单/含作废批次整体拒绝 → 借修订移除已作废批次 →
+历次确认快照保留 → 已确认单据不可修订）；
 开工前清洁更正预演示例见 [`examples/cleaning_preview_demo.py`](examples/cleaning_preview_demo.py)
 （已确认单据与整链 RELEASE 基线 → 预演改为不清洁逐批 HOLD 及变化原因 →
 结论相同仍属版本影响范围 → 只读性核对 → 未知批次/非法过敏原拒绝 →
@@ -799,9 +885,11 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
 ├── examples/lot_lock_demo.py     # 原料批号待检锁定/出货资格端到端调用示例
 ├── examples/batch_void_demo.py   # 误登记批次作废端到端调用示例
 ├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
+├── examples/verification_revise_demo.py # 出货前批次清单修订（乐观修订号）端到端调用示例
 ├── examples/cleaning_preview_demo.py # 开工前清洁更正预演（只读）端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
 ├── tests/test_verification.py    # pytest 测试（出货核验单，15 项）
+├── tests/test_verification_revise.py # pytest 测试（批次清单修订/修订号/并发一致性/旧库升级，19 项）
 ├── tests/test_lot_lock.py        # pytest 测试（批号锁定/出货资格/旧库升级，18 项）
 ├── tests/test_batch_void.py      # pytest 测试（批次作废/重算联动/核验单拒绝/旧库升级，23 项）
 ├── tests/test_batch_reassign.py  # pytest 测试（误归产线换线/两线重算/历史归属/资格不递增/核验单联动/原子性，26 项）
@@ -824,15 +912,20 @@ curl -s http://127.0.0.1:8080/api/batches/B003/history
   锁定/解除历史（`LOCK` / `UNLOCK`）
 - `shipment_eligibility` / `shipment_eligibility_version`：每批当前出货资格与只追加历史
   （`REGISTER` / `LOT_LOCK` / `LOT_UNLOCK` / `CORRECT_BATCH` / `UPGRADE_INIT`）
-- `verification`：出货核验单（`DRAFT` / `PENDING_REVIEW` / `CONFIRMED`）
-- `verification_batch`：核验单逐批快照（创建/重新核验时的裁决版本/结论与出货资格版本/状态，按提交顺序保序）
+- `verification`：出货核验单（`DRAFT` / `PENDING_REVIEW` / `CONFIRMED`；
+  `revision` 单据修订号，创建为 1，重新核验/批次清单修订/确认等单据快照写入时递增，
+  用于修订的乐观并发校验）
+- `verification_batch`：核验单逐批快照（创建/重新核验/批次清单修订时的裁决版本/结论
+  与出货资格版本/状态，按提交顺序保序；修订时整体重写）
 - `verification_confirmation` / `verification_confirmation_batch`：只追加的历次确认及其逐批快照副本
 
 所有写操作在单事务（`BEGIN IMMEDIATE`）内完成并进程内串行化，配合外键约束与 WAL，
 保证更正与登记的原子性：校验失败即整体回滚，不会产生半成品批次或半成品重算版本。
-核验单创建（未知/重复批次在写入前整体校验）、重新核验与确认（校验与确认记录写入同一事务，
-失败不留下确认记录）遵循同样的原子性保证；新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入，
-既有快照表新增列通过 `ALTER TABLE`（逐列检查）幂等补齐，旧数据库启动时自动升级，
+核验单创建（未知/重复批次在写入前整体校验）、重新核验、批次清单修订与确认
+（校验与快照写入同一事务，失败不留下成员/快照/确认记录）遵循同样的原子性保证；
+新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入，既有快照表新增列与
+`verification.revision` 修订号列通过 `ALTER TABLE`（逐列检查）幂等补齐
+（既有单据修订号按 1 计），旧数据库启动时自动升级，
 并为既有批次补出货资格 v1（`UPGRADE_INIT`，不改变既有核验单状态；升级前的旧确认快照
 出货资格字段为空，确认时要求先重新核验）；批次表的 `status`/`voided_reason`/`voided_at`
 作废列同样幂等补齐（既有批次为 `ACTIVE`），作废相关索引在列迁移后建立；

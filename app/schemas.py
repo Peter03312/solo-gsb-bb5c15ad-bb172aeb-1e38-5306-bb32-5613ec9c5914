@@ -51,3 +51,16 @@ class BatchReassignIn(BaseModel):
 class VerificationIn(BaseModel):
     verification_no: str = Field(..., description="出货核验单号（唯一）")
     batch_nos: list[str] = Field(..., min_length=1, description="关联的已登记生产批次号列表；非空、不可重复，按提交顺序保存")
+
+
+class VerificationReviseIn(BaseModel):
+    expected_revision: int = Field(
+        ...,
+        ge=1,
+        description="工作人员所见单据修订号（乐观并发）；须与当前修订号一致，否则整体拒绝（VERIFICATION_REVISION_CONFLICT）",
+    )
+    batch_nos: list[str] = Field(
+        ...,
+        min_length=1,
+        description="修订后的完整批次号新清单：非空、不可重复、批次须全部存在且有效（ACTIVE），按提交顺序保存",
+    )

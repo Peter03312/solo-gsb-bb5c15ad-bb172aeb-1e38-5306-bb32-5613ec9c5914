@@ -1522,11 +1522,11 @@ class Service:
             now = _now()
             conn.execute(
                 """INSERT INTO verification
-                   (verification_no, status, created_at, updated_at, confirmed_at)
-                   VALUES (?, 'DRAFT', ?, ?, NULL)""",
+                   (verification_no, status, revision, created_at, updated_at, confirmed_at)
+                   VALUES (?, 'DRAFT', 1, ?, ?, NULL)""",
                 (verification_no, now, now),
             )
-            _refresh_snapshots(conn, verification_no, normalized)
+            _refresh_snapshots(conn, verification_no, normalized, bump_revision=False)
             row = conn.execute(
                 "SELECT * FROM verification WHERE verification_no = ?", (verification_no,)
             ).fetchone()
@@ -1595,6 +1595,113 @@ class Service:
                 ).fetchall()
             ]
             _refresh_snapshots(conn, verification_no, batch_nos)
+            row = conn.execute(
+                "SELECT * FROM verification WHERE verification_no = ?", (verification_no,)
+            ).fetchone()
+            return _verification_payload(conn, row)
+
+    def revise_verification(
+        self, verification_no: str, expected_revision: int, batch_nos: list[str]
+    ) -> dict[str, Any]:
+        """修订出货前批次清单（出货前装运批次发生变化时）。
+
+        仅草稿/待复核单据可修订，已确认单据不可直接修订；调用方须提交“所见修订号”，
+        过期修订号整体拒绝。保存时在同一事务内对新清单逐批重取当前裁决与出货资格
+        快照（避免并发批次更正/批号锁定混入不同时间的快照），单据回到草稿并推进修订号。
+        允许借此移除旧清单中的已作废批次；新清单中的批次必须全部有效——
+        空清单、重复/未知批次、含已作废批次、过期修订号均整体拒绝，当前成员与快照不变。
+        历次确认及其当时的逐批快照始终保留。
+        """
+        # 形状层校验先于事务：空清单/非数组/修订号非法为 400 或 422（pydantic）
+        if not isinstance(batch_nos, list) or not batch_nos:
+            raise bad_request("INVALID_PAYLOAD", "batch_nos 必须是非空批次号数组")
+        normalized: list[str] = []
+        for bn in batch_nos:
+            if not isinstance(bn, str) or not bn.strip():
+                raise bad_request("INVALID_PAYLOAD", "batch_nos 必须是非空字符串数组")
+            bn = bn.strip()
+            if bn in normalized:
+                raise bad_request(
+                    "DUPLICATE_BATCH_IN_VERIFICATION", f"批次号在列表中重复: {bn}"
+                )
+            normalized.append(bn)
+
+        with self.store.write() as conn:
+            # BEGIN IMMEDIATE 已获取写锁：下列“读校验 → 重取快照 → 写入”在同一事务内
+            # 完成，并发的批次更正/批号锁定在此期间要么已提交可见、要么尚未提交，
+            # 逐批快照均取自同一事务快照，不会混入不同时间的数据。
+            row = conn.execute(
+                "SELECT * FROM verification WHERE verification_no = ?", (verification_no,)
+            ).fetchone()
+            if not row:
+                raise not_found(
+                    "VERIFICATION_NOT_FOUND", f"出货核验单不存在: {verification_no}"
+                )
+            if row["status"] == "CONFIRMED":
+                raise conflict(
+                    "VERIFICATION_ALREADY_CONFIRMED",
+                    "已确认单据不能直接修订批次清单；如所含批次已产生新版本，单据会自动转待复核",
+                )
+            current_revision = row["revision"]
+            if expected_revision != current_revision:
+                raise conflict(
+                    "VERIFICATION_REVISION_CONFLICT",
+                    (
+                        f"修订号已过期：提交基于 v{expected_revision}，"
+                        f"单据当前修订号为 v{current_revision}；请重新查询单据获取最新清单与修订号后再修订"
+                    ),
+                    [
+                        {
+                            "reason_code": "VERIFICATION_REVISION_CONFLICT",
+                            "submitted_revision": expected_revision,
+                            "current_revision": current_revision,
+                            "message": "并发修改已推进单据修订号，本次修订整体拒绝，当前成员与快照不变",
+                        }
+                    ],
+                )
+
+            placeholders = ",".join("?" * len(normalized))
+            known = {
+                r["batch_no"]
+                for r in conn.execute(
+                    f"SELECT batch_no FROM batch WHERE batch_no IN ({placeholders})",
+                    normalized,
+                ).fetchall()
+            }
+            unknown = [bn for bn in normalized if bn not in known]
+            if unknown:
+                raise bad_request(
+                    "UNKNOWN_BATCH", f"未知批次（未登记）: {', '.join(unknown)}"
+                )
+
+            # 新清单中的批次必须全部有效；允许移除旧清单中的已作废批次，
+            # 但不允许再次加入任何已作废批次。
+            voided = [
+                r["batch_no"]
+                for r in conn.execute(
+                    f"""SELECT batch_no FROM batch
+                        WHERE batch_no IN ({placeholders}) AND status = 'VOIDED'
+                        ORDER BY batch_no""",
+                    normalized,
+                ).fetchall()
+            ]
+            if voided:
+                raise bad_request(
+                    "BATCH_VOIDED",
+                    f"批次已作废，不能加入核验单: {', '.join(voided)}",
+                    [
+                        {
+                            "batch_no": bn,
+                            "reason_code": "BATCH_VOIDED",
+                            "message": "批次已作废（误登记未投产），新清单中的批次必须全部有效",
+                        }
+                        for bn in voided
+                    ],
+                )
+
+            # 校验全部通过后才重写成员与逐批快照：失败路径不执行 DELETE，
+            # 当前成员与快照保持原样。
+            _refresh_snapshots(conn, verification_no, normalized)
             row = conn.execute(
                 "SELECT * FROM verification WHERE verification_no = ?", (verification_no,)
             ).fetchone()
@@ -1783,7 +1890,7 @@ class Service:
             )
             conn.execute(
                 """UPDATE verification
-                   SET status='CONFIRMED', confirmed_at=?, updated_at=?
+                   SET status='CONFIRMED', confirmed_at=?, updated_at=?, revision=revision+1
                    WHERE verification_no=?""",
                 (now, now, verification_no),
             )
@@ -2222,6 +2329,7 @@ def _verification_payload(conn, row, *, with_history: bool = True) -> dict[str, 
     payload = {
         "verification_no": row["verification_no"],
         "status": row["status"],
+        "revision": row["revision"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "confirmed_at": row["confirmed_at"],
@@ -2234,9 +2342,15 @@ def _verification_payload(conn, row, *, with_history: bool = True) -> dict[str, 
     return payload
 
 
-def _refresh_snapshots(conn, verification_no: str, batch_nos: list[str]) -> None:
+def _refresh_snapshots(
+    conn, verification_no: str, batch_nos: list[str], *, bump_revision: bool = True
+) -> None:
     """按提交顺序用各批“当前裁决版本与结论、出货资格版本与状态”重写逐批快照
-    （草稿/待复核重新核验）。"""
+    （草稿/待复核重新核验、修订批次清单）。
+
+    重写逐批快照属于单据快照写入：推进修订号（创建时修订号已在 INSERT 置 1，
+    显式 bump_revision=False 不再递增）。
+    """
     now = _now()
     conn.execute("DELETE FROM verification_batch WHERE verification_no = ?", (verification_no,))
     rows = conn.execute(
@@ -2279,3 +2393,8 @@ def _refresh_snapshots(conn, verification_no: str, batch_nos: list[str]) -> None
         "UPDATE verification SET status='DRAFT', updated_at=? WHERE verification_no=?",
         (now, verification_no),
     )
+    if bump_revision:
+        conn.execute(
+            "UPDATE verification SET revision = revision + 1 WHERE verification_no=?",
+            (verification_no,),
+        )
