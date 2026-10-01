@@ -139,9 +139,12 @@ CREATE INDEX IF NOT EXISTS idx_version_batch
     ON adjudication_version(batch_no, version);
 
 -- 出货核验单：一张单据关联多个已登记生产批次，逐批保存裁决快照
+-- revision：单据“成员清单/逐批快照内容”的修订号（乐观锁）。创建为 1；
+-- 重新核验、批次清单修订等重写逐批快照的操作各 +1；确认只追加确认历史，不推进修订号。
 CREATE TABLE IF NOT EXISTS verification (
     verification_no  TEXT PRIMARY KEY,
     status           TEXT NOT NULL,             -- DRAFT / PENDING_REVIEW / CONFIRMED
+    revision         INTEGER NOT NULL DEFAULT 1,-- 逐批快照修订号：每次重写快照 +1（并发修订凭此整体拒绝过期请求）
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
     confirmed_at     TEXT
@@ -167,9 +170,11 @@ CREATE TABLE IF NOT EXISTS verification_batch (
 CREATE INDEX IF NOT EXISTS idx_vbatch_batch ON verification_batch(batch_no);
 
 -- 历次确认（只追加；单据转待复核/重新核验后可再次确认，历史确认不覆盖）
+-- revision 记录该次确认时单据的修订号（修订批次清单/重新核验会推进修订号）
 CREATE TABLE IF NOT EXISTS verification_confirmation (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     verification_no  TEXT NOT NULL REFERENCES verification(verification_no),
+    revision         INTEGER,
     confirmed_at     TEXT NOT NULL
 );
 
@@ -291,6 +296,10 @@ _MIGRATION_COLUMNS = [
     ("verification_confirmation_batch", "snapshot_ship_status", "TEXT"),
     ("verification_confirmation_batch", "snapshot_locked_lots", "TEXT NOT NULL DEFAULT '[]'"),
     ("verification_confirmation_batch", "snapshot_ship_reasons", "TEXT NOT NULL DEFAULT '[]'"),
+    # 单据修订号：旧库既有单据视为修订号 1（与“创建即 revision=1”语义一致）
+    ("verification", "revision", "INTEGER NOT NULL DEFAULT 1"),
+    # 历次确认补记修订号：旧确认为 NULL（修订号功能上线前发生）
+    ("verification_confirmation", "revision", "INTEGER"),
 ]
 
 

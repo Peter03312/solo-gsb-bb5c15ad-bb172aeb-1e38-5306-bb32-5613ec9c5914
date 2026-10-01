@@ -17,6 +17,7 @@ from .schemas import (
     MaterialLotCorrection,
     MaterialLotIn,
     VerificationIn,
+    VerificationReviseIn,
 )
 from .service import Service
 
@@ -219,8 +220,22 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
 
     @app.post("/api/verifications/{verification_no}/reverify", tags=["出货核验单"])
     def reverify_verification(verification_no: str, service: Service = Depends(svc)):
-        """重新核验：刷新逐批快照并回到草稿（草稿/待复核可用；已确认拒绝）。"""
+        """重新核验：刷新逐批快照并回到草稿（草稿/待复核可用；已确认拒绝），修订号 +1。"""
         return service.reverify_verification(verification_no)
+
+    @app.put("/api/verifications/{verification_no}/batches", tags=["出货核验单"])
+    def revise_verification(verification_no: str, body: VerificationReviseIn, service: Service = Depends(svc)):
+        """修订批次清单（出货前装运批次变化时的全量替换）。
+
+        仅草稿/待复核单据可修订；请求体携带所见修订号 expected_revision 与
+        完整、有序的新批次清单。保存时在同一事务内重取每批当前裁决与出货资格
+        快照，单据回到草稿并推进修订号；允许移除旧清单中的已作废批次，
+        新清单批次必须全部有效。空清单、重复或未知批次、含已作废批次、
+        过期修订号、已确认单据均整体拒绝；历次确认及其逐批快照始终保留。
+        """
+        return service.revise_verification(
+            verification_no, body.expected_revision, body.batch_nos
+        )
 
     @app.post("/api/verifications/{verification_no}/confirm", tags=["出货核验单"])
     def confirm_verification(verification_no: str, service: Service = Depends(svc)):
